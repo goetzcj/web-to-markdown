@@ -96,12 +96,41 @@ def _maybe_fix_mojibake(text: str) -> str:
     return text
 
 
+def _strip_noncontent_nodes(doc: "lxml.html.HtmlElement") -> None:
+    """Remove common non-content containers from an lxml doc in-place."""
+
+    # Remove whole tags that are almost always chrome.
+    for tag in ["nav", "aside", "footer", "header", "script", "style", "noscript"]:
+        for node in doc.xpath(f"//{tag}"):
+            parent = node.getparent()
+            if parent is not None:
+                parent.remove(node)
+
+    # Remove common ARIA/role containers.
+    for node in doc.xpath("//*[@role='navigation' or @role='banner' or @role='contentinfo']"):
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+
+    # Remove obvious cookie/consent modals.
+    consent_xpath = (
+        "//*[contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cookie') "
+        "or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cookie') "
+        "or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'consent') "
+        "or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'consent')]"
+    )
+    for node in doc.xpath(consent_xpath):
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+
+
 def _candidate_html_blocks(html: str) -> list[str]:
     """Return a list of candidate HTML blocks to convert to markdown.
 
-    Readability is great, but on some modern marketing sites it can latch onto a
-    single section instead of the full main content. We generate a few candidates
-    and later pick the best markdown output.
+    Readability is great, but on some modern sites it can latch onto a single
+    section or a cookie modal. We generate a few candidates (with a stripped
+    version for <main>/<article>/<body>) and later pick the best markdown output.
     """
 
     candidates: list[str] = []
@@ -113,20 +142,26 @@ def _candidate_html_blocks(html: str) -> list[str]:
         try:
             doc = lxml.html.fromstring(html)
 
-            # 2) <main>
+            # 2) <main> (stripped)
             mains = doc.xpath("//main")
             for node in mains[:2]:
-                candidates.append(lxml.html.tostring(node, encoding="unicode", method="html"))
+                node_doc = lxml.html.fromstring(lxml.html.tostring(node, encoding="unicode", method="html"))
+                _strip_noncontent_nodes(node_doc)
+                candidates.append(lxml.html.tostring(node_doc, encoding="unicode", method="html"))
 
-            # 3) <article>
+            # 3) <article> (stripped)
             articles = doc.xpath("//article")
             for node in articles[:2]:
-                candidates.append(lxml.html.tostring(node, encoding="unicode", method="html"))
+                node_doc = lxml.html.fromstring(lxml.html.tostring(node, encoding="unicode", method="html"))
+                _strip_noncontent_nodes(node_doc)
+                candidates.append(lxml.html.tostring(node_doc, encoding="unicode", method="html"))
 
-            # 4) body (last resort)
+            # 4) body (stripped)
             bodies = doc.xpath("//body")
             for node in bodies[:1]:
-                candidates.append(lxml.html.tostring(node, encoding="unicode", method="html"))
+                node_doc = lxml.html.fromstring(lxml.html.tostring(node, encoding="unicode", method="html"))
+                _strip_noncontent_nodes(node_doc)
+                candidates.append(lxml.html.tostring(node_doc, encoding="unicode", method="html"))
         except Exception:
             pass
 
@@ -151,7 +186,8 @@ def _candidate_html_blocks(html: str) -> list[str]:
 def _best_markdown_from_html(html: str) -> str:
     """Convert HTML to markdown using the best candidate extraction strategy.
 
-    We score candidates to prefer real article text over navigation/link farms.
+    We score candidates to prefer real article text over navigation/link farms,
+    and to avoid cookie-consent modal captures.
     """
 
     best = ""
@@ -165,17 +201,48 @@ def _best_markdown_from_html(html: str) -> str:
         visible = re.sub(r"https?://\S+", "", visible)
         visible = re.sub(r"\s+", " ", visible).strip()
 
+        visible_len = len(visible)
         link_count = md.count("](")
         pipe_count = md.count("|")
+        heading_count = md.count("\n#") + (1 if md.startswith("#") else 0)
+
+        lower = visible.lower()
+        cookie_hits = sum(
+            1
+            for s in [
+                "cookie preferences",
+                "select your cookie preferences",
+                "we use essential cookies",
+                "accept",
+                "decline",
+                "customize",
+            ]
+            if s in lower
+        )
+        toc_hits = 0
+        if "table of contents" in lower or "contents" in lower[:200]:
+            toc_hits = 1
 
         # Base score: visible text length.
-        score = float(len(visible))
-        # Penalize link-heavy / table-like nav.
-        score -= link_count * 30.0
+        score = float(visible_len)
+
+        # Prefer more structural content (headings are a good sign).
+        score += heading_count * 50.0
+
+        # Penalize link-heavy / table-like nav, but not so hard that we always pick tiny snippets.
+        score -= link_count * 10.0
         score -= pipe_count * 2.0
+
+        # Hard penalties for common bad captures.
+        score -= cookie_hits * 500.0
+        score -= toc_hits * 250.0
 
         # Slightly prefer earlier candidates (readability/main/article) when close.
         score -= idx * 5.0
+
+        # If we have extremely short content, down-rank it.
+        if visible_len < 400:
+            score -= 200.0
 
         if score > best_score:
             best = md
@@ -195,8 +262,21 @@ def _is_thin_content(markdown: str, threshold: int = 200) -> bool:
 
 def _clean_markdown(markdown: str) -> str:
     """Post-process to remove common noise patterns from converted markdown."""
-    markdown = re.sub(r'\n{3,}', '\n\n', markdown)       # collapse excessive blank lines
-    markdown = re.sub(r'^\W{3,}$', '', markdown, flags=re.MULTILINE)  # decorative dividers
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown)  # collapse excessive blank lines
+    markdown = re.sub(r"^\W{3,}$", "", markdown, flags=re.MULTILINE)  # decorative dividers
+
+    # Drop common cookie-consent / privacy modal boilerplate blocks (best-effort).
+    cookie_patterns = [
+        r"select your cookie preferences",
+        r"cookie preferences",
+        r"we use (essential )?cookies",
+        r"accept\s+decline\s+customize",
+        r"manage cookies",
+        r"privacy choices",
+    ]
+    for pat in cookie_patterns:
+        markdown = re.sub(pat, "", markdown, flags=re.IGNORECASE)
+
     return markdown.strip()
 
 
