@@ -1,8 +1,11 @@
 ---
 name: web-to-markdown
 description: Use this skill whenever an agent needs to read a webpage, fetch API documentation, load example code from a URL, or access an OpenAPI/Swagger spec. Trigger this skill immediately if an agent reports a page is "JavaScript heavy", returns empty content, or gives up and searches for alternatives — that's exactly the problem this skill solves. Also use when pointing any agent at documentation sites, GitHub READMEs, blog posts, or technical references where raw HTML would waste tokens. Produces clean agent-readable markdown with 60-80% fewer tokens than raw HTML by stripping navigation, ads, scripts, and boilerplate using the same algorithm as Firefox Reader Mode.
-compatibility: pip install requests readability-lxml html2text playwright && playwright install chromium
 ---
+
+> Dependencies (install where you run the scripts):
+> 
+> `pip install requests readability-lxml html2text playwright && playwright install chromium`
 
 # Web-to-Markdown Skill
 

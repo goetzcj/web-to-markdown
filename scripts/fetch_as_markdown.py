@@ -22,6 +22,15 @@ import argparse
 import requests
 import html2text
 
+# Silence noisy dependency warnings when pip resolves a compatible-but-not-whitelisted combo.
+try:
+    import warnings
+    from requests.exceptions import RequestsDependencyWarning
+
+    warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
+except Exception:
+    pass
+
 try:
     from readability import Document
     READABILITY_AVAILABLE = True
@@ -33,6 +42,12 @@ try:
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
+
+try:
+    import lxml.html  # type: ignore
+    LXML_AVAILABLE = True
+except ImportError:
+    LXML_AVAILABLE = False
 
 
 # ── Internal helpers ────────────────────────────────────────────────────────────
@@ -50,18 +65,123 @@ def _html_to_markdown(html: str) -> str:
 
 
 def _extract_main_content(html: str) -> str:
-    """
-    Strip nav, ads, sidebars, and footers using the readability algorithm.
-    This is the same approach Firefox Reader Mode uses, which means it's
-    battle-tested across millions of real-world pages. Falls back to full
-    HTML if readability isn't installed.
-    """
+    """Extract the primary content using readability when available."""
     if READABILITY_AVAILABLE:
         try:
             return Document(html).summary(html_partial=True)
         except Exception:
             pass
     return html
+
+
+def _maybe_fix_mojibake(text: str) -> str:
+    """Fix common UTF-8/latin-1 mojibake artifacts (â€™, Â, etc.).
+
+    This is a pragmatic heuristic: only attempt the fix when the telltale sequences
+    appear, and fall back silently if it doesn't work.
+    """
+
+    if "â" not in text and "Â" not in text:
+        return text
+
+    try:
+        fixed = text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+    except Exception:
+        return text
+
+    # Only accept the fix if it actually removes the common sequences.
+    if fixed.count("â") + fixed.count("Â") < text.count("â") + text.count("Â"):
+        return fixed
+
+    return text
+
+
+def _candidate_html_blocks(html: str) -> list[str]:
+    """Return a list of candidate HTML blocks to convert to markdown.
+
+    Readability is great, but on some modern marketing sites it can latch onto a
+    single section instead of the full main content. We generate a few candidates
+    and later pick the best markdown output.
+    """
+
+    candidates: list[str] = []
+
+    # 1) Readability (best when it works).
+    candidates.append(_extract_main_content(html))
+
+    if LXML_AVAILABLE:
+        try:
+            doc = lxml.html.fromstring(html)
+
+            # 2) <main>
+            mains = doc.xpath("//main")
+            for node in mains[:2]:
+                candidates.append(lxml.html.tostring(node, encoding="unicode", method="html"))
+
+            # 3) <article>
+            articles = doc.xpath("//article")
+            for node in articles[:2]:
+                candidates.append(lxml.html.tostring(node, encoding="unicode", method="html"))
+
+            # 4) body (last resort)
+            bodies = doc.xpath("//body")
+            for node in bodies[:1]:
+                candidates.append(lxml.html.tostring(node, encoding="unicode", method="html"))
+        except Exception:
+            pass
+
+    # Always include full HTML as final fallback.
+    candidates.append(html)
+
+    # De-dupe while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in candidates:
+        key = item.strip()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+
+    return unique
+
+
+def _best_markdown_from_html(html: str) -> str:
+    """Convert HTML to markdown using the best candidate extraction strategy.
+
+    We score candidates to prefer real article text over navigation/link farms.
+    """
+
+    best = ""
+    best_score = float("-inf")
+
+    for idx, candidate in enumerate(_candidate_html_blocks(html)):
+        md = _clean_markdown(_html_to_markdown(candidate))
+
+        # Estimate "visible" text (strip URLs from markdown links).
+        visible = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", md)
+        visible = re.sub(r"https?://\S+", "", visible)
+        visible = re.sub(r"\s+", " ", visible).strip()
+
+        link_count = md.count("](")
+        pipe_count = md.count("|")
+
+        # Base score: visible text length.
+        score = float(len(visible))
+        # Penalize link-heavy / table-like nav.
+        score -= link_count * 30.0
+        score -= pipe_count * 2.0
+
+        # Slightly prefer earlier candidates (readability/main/article) when close.
+        score -= idx * 5.0
+
+        if score > best_score:
+            best = md
+            best_score = score
+
+    return best
 
 
 def _is_thin_content(markdown: str, threshold: int = 200) -> bool:
@@ -83,22 +203,28 @@ def _clean_markdown(markdown: str) -> str:
 def _static_fetch(url: str, timeout: int = 15) -> str | None:
     """Fast HTTP fetch. Sends a browser-like User-Agent to avoid basic bot blocks."""
     try:
-        r = requests.get(url, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; WebToMarkdown/1.0)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }, timeout=timeout)
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; WebToMarkdown/1.0)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
+            timeout=timeout,
+        )
         r.raise_for_status()
-        return r.text
+
+        # Normalize encoding to reduce mojibake.
+        if not r.encoding or r.encoding.lower() == "iso-8859-1":
+            r.encoding = r.apparent_encoding
+
+        return _maybe_fix_mojibake(r.text)
     except Exception:
         return None
 
 
 def _playwright_fetch(url: str, wait_ms: int = 3000) -> str | None:
-    """
-    Headless Chromium fetch. Used when static fetch returns thin content.
-    The wait_ms gives JS frameworks time to finish rendering after load.
-    """
+    """Headless Chromium fetch for JS-rendered pages."""
     if not PLAYWRIGHT_AVAILABLE:
         return None
     try:
@@ -109,7 +235,7 @@ def _playwright_fetch(url: str, wait_ms: int = 3000) -> str | None:
             page.wait_for_timeout(wait_ms)
             html = page.content()
             browser.close()
-            return html
+            return _maybe_fix_mojibake(html)
     except Exception:
         return None
 
@@ -133,7 +259,7 @@ def fetch_as_markdown(url: str, playwright_first: bool = False) -> str:
     if not playwright_first:
         html = _static_fetch(url)
         if html:
-            md = _clean_markdown(_html_to_markdown(_extract_main_content(html)))
+            md = _best_markdown_from_html(html)
             if not _is_thin_content(md):
                 return md
             # Thin content detected — fall through to Playwright
@@ -149,12 +275,7 @@ def fetch_as_markdown(url: str, playwright_first: bool = False) -> str:
             )
         return f"ERROR: Could not fetch {url}. The page may require authentication or block automated access."
 
-    md = _clean_markdown(_html_to_markdown(_extract_main_content(html)))
-
-    if _is_thin_content(md):
-        # Readability may have over-stripped structured content (e.g. Swagger UI,
-        # API docs, SPAs). Fall back to raw HTML→markdown before declaring failure.
-        md = _clean_markdown(_html_to_markdown(html))
+    md = _best_markdown_from_html(html)
 
     if _is_thin_content(md):
         return (
